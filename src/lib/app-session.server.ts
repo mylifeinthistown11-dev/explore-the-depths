@@ -86,10 +86,14 @@ export async function startSession(input: {
     .eq("isRevoked", false)
     .select("expiresAt");
 
+  // Every previously cached jti for this user may now be revoked.
+  invalidateSessionCache();
+
   // Only a row that had not expired yet counts as "another device was active".
   const terminatedOther = (cleared ?? []).some(
     (row) => new Date(String(row["expiresAt"])) > new Date(),
   );
+
 
   const { error } = await db.from("sessions").insert({
     id: newId(),
