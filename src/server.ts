@@ -67,6 +67,8 @@ function withSecurityHeaders(response: Response): Response {
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {
+      const { configurationService } = await import("./lib/app-config.server");
+      await configurationService.initialize();
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
       return withSecurityHeaders(await normalizeCatastrophicSsrResponse(response));

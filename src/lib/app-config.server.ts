@@ -1,182 +1,224 @@
-/**
- * Server-only configuration layer for the six system configuration values.
- *
- * Source of truth is the BOOTSTRAP store (see bootstrap-store.server.ts), which
- * does not depend on the application database — so /configuration keeps working
- * on a fresh deployment with no database configured at all. Deployment
- * environment variables are used as a fallback. Secrets never leave this module.
- */
-import { CONFIG_KEYS, readAll, readConfig, writeConfig, isDurable } from "./bootstrap-store.server";
-import { applyOwnDbOverrides } from "./own-db.server";
+import { CONFIG_KEYS, readBootstrap, writeBootstrap, type BootstrapStore } from "./bootstrap-store.server";
+import { applyOwnDbOverrides, projectUrlFromDbUrl } from "./own-db.server";
 
 export { CONFIG_KEYS };
 export type ConfigKey = (typeof CONFIG_KEYS)[number];
 
-/** Pushes the currently configured database credentials into the data layer. */
-async function syncRuntime(): Promise<void> {
-  const values = await readAll();
-  applyOwnDbOverrides({
-    dbUrl: values["OWN_SUPABASE_DB_URL"] ?? null,
-    serviceRoleKey: values["OWN_SUPABASE_SERVICE_ROLE_KEY"] ?? null,
-  });
-}
-
-/** Effective value for a configuration key (bootstrap store, else env). */
-export async function getConfig(key: ConfigKey): Promise<string | undefined> {
-  return readConfig(key);
-}
-
-/** True when the application has enough configuration to reach its database. */
-export async function isConfigured(): Promise<boolean> {
-  const values = await readAll();
-  return Boolean(values["OWN_SUPABASE_DB_URL"] && values["OWN_SUPABASE_SERVICE_ROLE_KEY"]);
-}
-
-/** Status only — no secret value is ever returned. */
-export async function getConfigStatus(): Promise<{
+type ConfigurationStatus = {
+  configured: boolean;
   mode: "BOOTSTRAP" | "NORMAL";
   durableStore: boolean;
-  configured: Record<ConfigKey, boolean>;
+  fields: Record<ConfigKey, boolean>;
   adminEmail: string;
   database: { configured: boolean; connected: boolean; reason?: string };
-}> {
-  const values = await readAll();
-  const configured = {} as Record<ConfigKey, boolean>;
-  for (const key of CONFIG_KEYS) configured[key] = Boolean(values[key]);
+};
 
-  await syncRuntime();
+type PgClient = {
+  unsafe: (query: string, parameters?: unknown[]) => Promise<Record<string, unknown>[]>;
+  end: (options?: { timeout?: number }) => Promise<void>;
+};
 
-  const dbUrl = values["OWN_SUPABASE_DB_URL"];
-  let database: { configured: boolean; connected: boolean; reason?: string } = {
-    configured: Boolean(dbUrl),
-    connected: false,
-  };
-  if (dbUrl) {
-    const result = await testDatabaseUrl(dbUrl);
-    database = {
-      configured: true,
-      connected: result.ok,
-      ...(result.reason ? { reason: result.reason } : {}),
-    };
+const TABLE_SQL = `
+  create schema if not exists codearena_private;
+  create table if not exists codearena_private.application_configuration (
+    key text primary key,
+    value text not null,
+    updated_at timestamptz not null default now(),
+    constraint application_configuration_key_check check (key in (
+      'APP_SESSION_SECRET', 'ADMIN_EMAIL', 'ADMIN_PASSWORD',
+      'DEFAULT_STUDENT_PASSWORD', 'OWN_SUPABASE_DB_URL',
+      'OWN_SUPABASE_SERVICE_ROLE_KEY'
+    ))
+  )
+`;
+
+function isComplete(values: BootstrapStore): boolean {
+  return CONFIG_KEYS.every((key) => Boolean(values[key]));
+}
+
+async function openDatabase(databaseUrl: string): Promise<PgClient> {
+  const { default: postgres } = await import("postgres");
+  return postgres(databaseUrl, {
+    max: 1,
+    idle_timeout: 2,
+    connect_timeout: 8,
+    prepare: false,
+    onnotice: () => {},
+  }) as unknown as PgClient;
+}
+
+async function readDatabaseStore(databaseUrl: string): Promise<BootstrapStore> {
+  const sql = await openDatabase(databaseUrl);
+  try {
+    await sql.unsafe(TABLE_SQL);
+    const rows = await sql.unsafe(
+      "select key, value from codearena_private.application_configuration",
+    );
+    const values: BootstrapStore = {};
+    for (const row of rows) {
+      const key = row["key"];
+      const value = row["value"];
+      if (CONFIG_KEYS.includes(key as ConfigKey) && typeof value === "string" && value) {
+        values[key as ConfigKey] = value;
+      }
+    }
+    return values;
+  } finally {
+    await sql.end({ timeout: 1 }).catch(() => undefined);
+  }
+}
+
+async function writeDatabaseStore(databaseUrl: string, values: BootstrapStore): Promise<void> {
+  const sql = await openDatabase(databaseUrl);
+  try {
+    await sql.unsafe(TABLE_SQL);
+    for (const key of CONFIG_KEYS) {
+      const value = values[key];
+      if (!value) continue;
+      await sql.unsafe(
+        `insert into codearena_private.application_configuration (key, value, updated_at)
+         values ($1, $2, now())
+         on conflict (key) do update set value = excluded.value, updated_at = now()`,
+        [key, value],
+      );
+    }
+  } finally {
+    await sql.end({ timeout: 1 }).catch(() => undefined);
+  }
+}
+
+class ConfigurationService {
+  private async load(): Promise<{ values: BootstrapStore; connected: boolean; durable: boolean }> {
+    const bootstrap = await readBootstrap();
+    const bootstrapUrl = bootstrap["OWN_SUPABASE_DB_URL"];
+    const bootstrapKey = bootstrap["OWN_SUPABASE_SERVICE_ROLE_KEY"];
+
+    applyOwnDbOverrides({ dbUrl: bootstrapUrl ?? null, serviceRoleKey: bootstrapKey ?? null });
+
+    if (!bootstrapUrl) return { values: bootstrap, connected: false, durable: false };
+
+    try {
+      const stored = await readDatabaseStore(bootstrapUrl);
+      const values = { ...bootstrap, ...stored };
+      applyOwnDbOverrides({
+        dbUrl: values["OWN_SUPABASE_DB_URL"] ?? null,
+        serviceRoleKey: values["OWN_SUPABASE_SERVICE_ROLE_KEY"] ?? null,
+      });
+
+      // First successful connection migrates deployment/bootstrap values into
+      // PostgreSQL. This is idempotent and never deletes an existing value.
+      if (Object.keys(bootstrap).length > 0) await writeDatabaseStore(bootstrapUrl, values);
+      return { values, connected: true, durable: true };
+    } catch (error) {
+      if (isComplete(bootstrap)) {
+        console.warn("[configuration] PostgreSQL configuration store is temporarily unavailable");
+        return { values: bootstrap, connected: false, durable: true };
+      }
+      throw new Error("The persistent configuration store is temporarily unavailable.", {
+        cause: error,
+      });
+    }
   }
 
-  return {
-    mode: (await isConfigured()) ? "NORMAL" : "BOOTSTRAP",
-    durableStore: isDurable(),
-    configured,
-    adminEmail: values["ADMIN_EMAIL"] ?? "",
-    database,
-  };
+  async initialize(): Promise<void> {
+    await this.load();
+  }
+
+  async get(key: ConfigKey): Promise<string | undefined> {
+    return (await this.load()).values[key];
+  }
+
+  async set(key: ConfigKey, value: string): Promise<{ durable: true }> {
+    const current = await this.load();
+    const values = { ...current.values, [key]: value };
+    const databaseUrl = values["OWN_SUPABASE_DB_URL"];
+
+    if (databaseUrl) {
+      await writeDatabaseStore(databaseUrl, values);
+      // Keep the bootstrap pointer restart-safe for local/persistent-volume
+      // deployments. Deployment secrets remain the fallback on hosted runs.
+      try {
+        await writeBootstrap(values);
+      } catch {
+        // PostgreSQL is already the durable source of truth.
+      }
+      applyOwnDbOverrides({
+        dbUrl: databaseUrl,
+        serviceRoleKey: values["OWN_SUPABASE_SERVICE_ROLE_KEY"] ?? null,
+      });
+      return { durable: true };
+    }
+
+    await writeBootstrap(values);
+    return { durable: true };
+  }
+
+  async isConfigured(): Promise<boolean> {
+    return isComplete((await this.load()).values);
+  }
+
+  async getStatus(): Promise<ConfigurationStatus> {
+    const state = await this.load();
+    const fields = {} as Record<ConfigKey, boolean>;
+    for (const key of CONFIG_KEYS) fields[key] = Boolean(state.values[key]);
+    const configured = isComplete(state.values);
+    return {
+      configured,
+      mode: configured ? "NORMAL" : "BOOTSTRAP",
+      durableStore: state.durable,
+      fields,
+      adminEmail: state.values["ADMIN_EMAIL"] ?? "",
+      database: {
+        configured: Boolean(state.values["OWN_SUPABASE_DB_URL"]),
+        connected: state.connected,
+        ...(!state.connected && state.values["OWN_SUPABASE_DB_URL"]
+          ? { reason: "Database connection is temporarily unavailable." }
+          : {}),
+      },
+    };
+  }
 }
 
-/** Persists a configuration value and reinitialises the runtime services. */
-export async function setConfig(key: ConfigKey, value: string): Promise<{ durable: boolean }> {
-  const result = await writeConfig(key, value);
-  await syncRuntime();
-  return result;
-}
+export const configurationService = new ConfigurationService();
 
-/** Cryptographically secure secret, generated server-side. */
 export function generateSessionSecret(): string {
   const bytes = new Uint8Array(48);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-/**
- * Opens a real PostgreSQL connection with the supplied connection string and
- * runs a trivial query. No Supabase client and no Lovable Cloud involved.
- */
 export async function testDatabaseUrl(dbUrl: string): Promise<{ ok: boolean; reason?: string }> {
   const raw = dbUrl.trim();
-  let parsed: URL | null = null;
   try {
-    parsed = new URL(raw);
+    const parsed = new URL(raw);
+    if (!/^postgres(ql)?:$/i.test(parsed.protocol) || !parsed.hostname) throw new Error("invalid");
   } catch {
-    parsed = null;
-  }
-  const validScheme = parsed !== null && /^postgres(ql)?:$/i.test(parsed.protocol);
-  if (!validScheme || !parsed?.hostname) {
     return { ok: false, reason: "Invalid database connection URL." };
   }
-
-
-  type PgHandle = {
-    unsafe: (q: string) => Promise<unknown>;
-    end: (options?: { timeout?: number }) => Promise<void>;
-  };
-  let sql: PgHandle | null = null;
+  let sql: PgClient | null = null;
   try {
-    const { default: postgres } = await import("postgres");
-    sql = postgres(raw, {
-      max: 1,
-      idle_timeout: 2,
-      connect_timeout: 8,
-      prepare: false,
-      onnotice: () => {},
-    }) as unknown as PgHandle;
+    sql = await openDatabase(raw);
     await sql.unsafe("select 1");
     return { ok: true };
-  } catch (error) {
-    // Server-side only, and never with credentials in it.
-    console.warn(
-      "[configuration] database connection test failed",
-      (error as { code?: string } | null)?.code ?? "UNKNOWN",
-    );
-    return {
-      ok: false,
-      reason: "Unable to connect to the database. Please check the database URL and try again.",
-    };
+  } catch {
+    return { ok: false, reason: "Unable to connect to the database. Please check the database URL and try again." };
   } finally {
-    try {
-      await sql?.end({ timeout: 1 });
-    } catch {
-      /* ignore */
-    }
+    await sql?.end({ timeout: 1 }).catch(() => undefined);
   }
 }
 
-/**
- * Validates the service-role key against the database project derived from the
- * supplied connection string. Never logs or returns the key itself.
- */
-export async function testServiceRoleKey(
-  key: string,
-  dbUrl?: string,
-): Promise<{ ok: boolean; reason?: string }> {
+export async function testServiceRoleKey(key: string, dbUrl?: string): Promise<{ ok: boolean; reason?: string }> {
   const value = key.trim();
   if (!value) return { ok: false, reason: "Enter a service-role key." };
-
-  const { projectUrlFromDbUrl } = await import("./own-db.server");
-  const connection = dbUrl?.trim() || (await readConfig("OWN_SUPABASE_DB_URL")) || "";
+  const connection = dbUrl?.trim() || (await configurationService.get("OWN_SUPABASE_DB_URL")) || "";
   const projectUrl = projectUrlFromDbUrl(connection);
-  if (!projectUrl) {
-    // Nothing to validate against yet — the key is simply stored configuration.
-    return {
-      ok: true,
-      reason:
-        "Service key saved. Validation will occur when the application connects to the configured service.",
-    };
-  }
+  if (!projectUrl) return { ok: true, reason: "Service key saved. Validation will occur when the application connects." };
   try {
-    const response = await fetch(`${projectUrl}/rest/v1/`, {
-      headers: { apikey: value, Accept: "application/json" },
-    });
-    if (response.status === 401 || response.status === 403) {
-      return { ok: false, reason: "The service key was rejected. Please check the value." };
-    }
-    if (response.status >= 500) {
-      return {
-        ok: false,
-        reason: "The service is temporarily unavailable. Please try again shortly.",
-      };
-    }
+    const response = await fetch(`${projectUrl}/rest/v1/`, { headers: { apikey: value, Accept: "application/json" } });
+    if (response.status === 401 || response.status === 403) return { ok: false, reason: "The service key was rejected." };
+    if (response.status >= 500) return { ok: false, reason: "The service is temporarily unavailable." };
     return { ok: true, reason: "Service role key accepted" };
   } catch {
-    console.warn("[configuration] service key verification endpoint unreachable");
-    return {
-      ok: false,
-      reason: "Unable to reach the configured service. Please check the details and try again.",
-    };
+    return { ok: false, reason: "Unable to reach the configured service." };
   }
 }
