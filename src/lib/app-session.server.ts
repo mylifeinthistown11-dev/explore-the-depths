@@ -121,6 +121,42 @@ export async function startSession(input: {
 
 
 
+/**
+ * Session-row validity cache. Every server function validates the session, so
+ * an uncached lookup added a database round trip to every single request. A
+ * short TTL keeps revocation effectively immediate while removing that cost.
+ */
+const SESSION_CACHE_MS = 10_000;
+const sessionCache = new Map<string, { at: number; valid: boolean }>();
+
+/** Drops a jti from the validity cache so revocation applies immediately. */
+export function invalidateSessionCache(jti?: string): void {
+  if (jti) sessionCache.delete(jti);
+  else sessionCache.clear();
+}
+
+async function isSessionRowValid(jti: string): Promise<boolean> {
+  const cached = sessionCache.get(jti);
+  if (cached && Date.now() - cached.at < SESSION_CACHE_MS) return cached.valid;
+
+  const { data: row } = await ownDb()
+    .from("sessions")
+    .select("id, isRevoked, expiresAt")
+    .eq("tokenJti", jti)
+    .maybeSingle();
+  const valid = Boolean(
+    row && !row["isRevoked"] && new Date(String(row["expiresAt"])) >= new Date(),
+  );
+  sessionCache.set(jti, { at: Date.now(), valid });
+  // Bound the map on long-running processes.
+  if (sessionCache.size > 5000) {
+    for (const [key, entry] of sessionCache) {
+      if (Date.now() - entry.at > SESSION_CACHE_MS) sessionCache.delete(key);
+    }
+  }
+  return valid;
+}
+
 /** Reads and validates the current session, or returns null. */
 export async function readSession(): Promise<SessionClaims | null> {
   const token = readCookie();
@@ -134,18 +170,13 @@ export async function readSession(): Promise<SessionClaims | null> {
       jti: String(payload["jti"]),
     };
 
-    const { data: row } = await ownDb()
-      .from("sessions")
-      .select("id, isRevoked, expiresAt")
-      .eq("tokenJti", claims.jti)
-      .maybeSingle();
-    if (!row || row["isRevoked"] || new Date(String(row["expiresAt"])) < new Date()) return null;
-
+    if (!(await isSessionRowValid(claims.jti))) return null;
     return claims;
   } catch {
     return null;
   }
 }
+
 
 export async function requireSession(): Promise<SessionClaims> {
   const claims = await readSession();
