@@ -7,8 +7,9 @@
  * network, filesystem, timers or any host object. Only two host bridges are
  * exposed (`readLine` for stdin, `print` for stdout).
  */
-import { newQuickJSWASMModuleFromVariant, type QuickJSWASMModule } from "quickjs-emscripten-core";
-import variant from "@jitl/quickjs-singlefile-browser-release-sync";
+import { newQuickJSWASMModuleFromVariant, newVariant, type QuickJSWASMModule } from "quickjs-emscripten-core";
+import singlefileVariant from "@jitl/quickjs-singlefile-browser-release-sync";
+import wasmfileVariant from "@jitl/quickjs-wasmfile-release-sync";
 
 export type ExecOutcome = "ok" | "runtime_error" | "compilation_error" | "timeout" | "memory";
 
@@ -19,13 +20,41 @@ export interface ExecResult {
   durationMs: number;
 }
 
+/**
+ * Edge runtimes (Cloudflare workerd) forbid compiling WebAssembly from bytes at
+ * runtime — the single-file variant would abort with
+ * "Wasm code generation disallowed by embedder". There, the .wasm asset is
+ * imported as an already-compiled WebAssembly.Module. Node keeps the
+ * single-file variant, which needs no asset resolution.
+ */
+async function resolveVariant() {
+  try {
+    const imported = (await import(
+      /* @vite-ignore */ "@jitl/quickjs-wasmfile-release-sync/dist/emscripten-module.wasm"
+    )) as { default?: unknown };
+    const compiled = imported.default;
+    if (typeof WebAssembly !== "undefined" && compiled instanceof WebAssembly.Module) {
+      return newVariant(wasmfileVariant as never, { wasmModule: compiled } as never);
+    }
+  } catch {
+    // Asset import is unavailable in this runtime; use the embedded build.
+  }
+  return singlefileVariant as never;
+}
+
 let modulePromise: Promise<QuickJSWASMModule> | null = null;
 function getModule(): Promise<QuickJSWASMModule> {
   if (!modulePromise) {
-    modulePromise = newQuickJSWASMModuleFromVariant(variant as never);
+    modulePromise = resolveVariant()
+      .then((variant) => newQuickJSWASMModuleFromVariant(variant as never))
+      .catch((error) => {
+        modulePromise = null;
+        throw error;
+      });
   }
   return modulePromise;
 }
+
 
 const PRELUDE = `
 globalThis.__out = [];
