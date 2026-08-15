@@ -239,6 +239,8 @@ export const deleteStudent = createServerFn({ method: "POST" })
       .update({ isRevoked: true, revokedAt: now, updatedAt: now })
       .eq("userId", userId)
       .eq("isRevoked", false);
+    (await import("./app-session.server")).invalidateSessionCache();
+
 
     if (hasData) {
       await db
