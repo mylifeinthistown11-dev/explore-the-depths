@@ -303,7 +303,7 @@ export async function testDatabaseUrl(dbUrl: string): Promise<{ ok: boolean; rea
   }
   let sql: PgClient | null = null;
   try {
-    sql = await openDatabase(raw);
+    sql = openThrowawayDatabase(raw);
     await sql.unsafe("select 1");
     return { ok: true };
   } catch {
