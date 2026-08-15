@@ -35,6 +35,7 @@ import { Route as AuthenticatedAdminViolationsRouteImport } from './routes/_auth
 import { Route as AuthenticatedProblemsProblemIdRouteImport } from './routes/_authenticated/problems.$problemId'
 import { Route as AuthenticatedRoundsRoundIdRouteImport } from './routes/_authenticated/rounds.$roundId'
 import { Route as ApiBootstrapActionRouteImport } from './routes/api/bootstrap.$action'
+import { Route as ApiConfigurationStatusRouteImport } from './routes/api/configuration/status'
 import { Route as ApiPublicHealthRouteImport } from './routes/api/public/health'
 import { Route as ApiPublicBootstrapActionRouteImport } from './routes/api/public/bootstrap.$action'
 
@@ -180,6 +181,11 @@ const ApiBootstrapActionRoute = ApiBootstrapActionRouteImport.update({
   path: '/api/bootstrap/$action',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiConfigurationStatusRoute = ApiConfigurationStatusRouteImport.update({
+  id: '/api/configuration/status',
+  path: '/api/configuration/status',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiPublicHealthRoute = ApiPublicHealthRouteImport.update({
   id: '/api/public/health',
   path: '/api/public/health',
@@ -217,6 +223,7 @@ export interface FileRoutesByFullPath {
   '/problems/$problemId': typeof AuthenticatedProblemsProblemIdRoute
   '/rounds/$roundId': typeof AuthenticatedRoundsRoundIdRoute
   '/api/bootstrap/$action': typeof ApiBootstrapActionRoute
+  '/api/configuration/status': typeof ApiConfigurationStatusRoute
   '/api/public/health': typeof ApiPublicHealthRoute
   '/admin/': typeof AuthenticatedAdminIndexRoute
   '/api/public/bootstrap/$action': typeof ApiPublicBootstrapActionRoute
@@ -245,6 +252,7 @@ export interface FileRoutesByTo {
   '/problems/$problemId': typeof AuthenticatedProblemsProblemIdRoute
   '/rounds/$roundId': typeof AuthenticatedRoundsRoundIdRoute
   '/api/bootstrap/$action': typeof ApiBootstrapActionRoute
+  '/api/configuration/status': typeof ApiConfigurationStatusRoute
   '/api/public/health': typeof ApiPublicHealthRoute
   '/admin': typeof AuthenticatedAdminIndexRoute
   '/api/public/bootstrap/$action': typeof ApiPublicBootstrapActionRoute
@@ -276,6 +284,7 @@ export interface FileRoutesById {
   '/_authenticated/problems/$problemId': typeof AuthenticatedProblemsProblemIdRoute
   '/_authenticated/rounds/$roundId': typeof AuthenticatedRoundsRoundIdRoute
   '/api/bootstrap/$action': typeof ApiBootstrapActionRoute
+  '/api/configuration/status': typeof ApiConfigurationStatusRoute
   '/api/public/health': typeof ApiPublicHealthRoute
   '/_authenticated/admin/': typeof AuthenticatedAdminIndexRoute
   '/api/public/bootstrap/$action': typeof ApiPublicBootstrapActionRoute
@@ -307,6 +316,7 @@ export interface FileRouteTypes {
     | '/problems/$problemId'
     | '/rounds/$roundId'
     | '/api/bootstrap/$action'
+    | '/api/configuration/status'
     | '/api/public/health'
     | '/admin/'
     | '/api/public/bootstrap/$action'
@@ -335,6 +345,7 @@ export interface FileRouteTypes {
     | '/problems/$problemId'
     | '/rounds/$roundId'
     | '/api/bootstrap/$action'
+    | '/api/configuration/status'
     | '/api/public/health'
     | '/admin'
     | '/api/public/bootstrap/$action'
@@ -365,6 +376,7 @@ export interface FileRouteTypes {
     | '/_authenticated/problems/$problemId'
     | '/_authenticated/rounds/$roundId'
     | '/api/bootstrap/$action'
+    | '/api/configuration/status'
     | '/api/public/health'
     | '/_authenticated/admin/'
     | '/api/public/bootstrap/$action'
@@ -376,6 +388,7 @@ export interface RootRouteChildren {
   AuthRoute: typeof AuthRoute
   ConfigurationRoute: typeof ConfigurationRoute
   ApiBootstrapActionRoute: typeof ApiBootstrapActionRoute
+  ApiConfigurationStatusRoute: typeof ApiConfigurationStatusRoute
   ApiPublicHealthRoute: typeof ApiPublicHealthRoute
   ApiPublicBootstrapActionRoute: typeof ApiPublicBootstrapActionRoute
 }
@@ -564,6 +577,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiBootstrapActionRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/configuration/status': {
+      id: '/api/configuration/status'
+      path: '/api/configuration/status'
+      fullPath: '/api/configuration/status'
+      preLoaderRoute: typeof ApiConfigurationStatusRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/public/health': {
       id: '/api/public/health'
       path: '/api/public/health'
@@ -647,6 +667,7 @@ const rootRouteChildren: RootRouteChildren = {
   AuthRoute: AuthRoute,
   ConfigurationRoute: ConfigurationRoute,
   ApiBootstrapActionRoute: ApiBootstrapActionRoute,
+  ApiConfigurationStatusRoute: ApiConfigurationStatusRoute,
   ApiPublicHealthRoute: ApiPublicHealthRoute,
   ApiPublicBootstrapActionRoute: ApiPublicBootstrapActionRoute,
 }

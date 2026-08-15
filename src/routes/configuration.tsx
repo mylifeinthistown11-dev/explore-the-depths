@@ -156,7 +156,11 @@ function Dot({ ok }: { ok: boolean }) {
 
 function StatusPanel({ status }: { status: Status }) {
   const rows: { label: string; ok: boolean; text: string }[] = [
-    { label: "Backend", ok: true, text: "Online" },
+    {
+      label: "Application",
+      ok: status.applicationConfigured,
+      text: status.applicationConfigured ? "Configured" : "Initial configuration required",
+    },
     {
       label: "Database",
       ok: status.database.connected,
@@ -175,6 +179,19 @@ function StatusPanel({ status }: { status: Status }) {
       label: "Session secret",
       ok: status.configured.APP_SESSION_SECRET,
       text: status.configured.APP_SESSION_SECRET ? "Configured" : "Not configured",
+    },
+    {
+      label: "Admin account",
+      ok: status.configured.ADMIN_EMAIL && status.configured.ADMIN_PASSWORD,
+      text:
+        status.configured.ADMIN_EMAIL && status.configured.ADMIN_PASSWORD
+          ? "Configured"
+          : "Not configured",
+    },
+    {
+      label: "Student password",
+      ok: status.configured.DEFAULT_STUDENT_PASSWORD,
+      text: status.configured.DEFAULT_STUDENT_PASSWORD ? "Configured" : "Not configured",
     },
   ];
 
@@ -196,10 +213,9 @@ function StatusPanel({ status }: { status: Status }) {
             <span>{row.text}</span>
           </div>
         ))}
-        {!status.durableStore && (
+        {!status.durableStore && status.mode === "BOOTSTRAP" && (
           <p className="sm:col-span-2 text-xs text-destructive">
-            This runtime has no writable configuration volume, so saved values live only in the
-            running process. Set BOOTSTRAP_CONFIG_PATH to a persistent path for restart-safe storage.
+            Persistent bootstrap storage is unavailable. Configuration has not been saved.
           </p>
         )}
       </CardContent>

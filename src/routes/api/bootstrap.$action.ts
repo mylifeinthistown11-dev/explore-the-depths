@@ -44,7 +44,7 @@ export const Route = createFileRoute("/api/bootstrap/$action")({
           const { getConfigStatus } = await import("@/lib/app-config.server");
           return json({ backend: "online", ...(await getConfigStatus()) });
         } catch {
-          return json({ backend: "online", mode: "BOOTSTRAP" });
+          return json({ error: "Configuration status is temporarily unavailable." }, 503);
         }
       },
       POST: async ({ params, request }) => {
