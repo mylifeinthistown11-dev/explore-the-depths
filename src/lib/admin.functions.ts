@@ -200,7 +200,9 @@ export const setStudentActive = createServerFn({ method: "POST" })
         .update({ isRevoked: true, revokedAt: nowIso(), updatedAt: nowIso() })
         .eq("userId", data.userId)
         .eq("isRevoked", false);
+      (await import("./app-session.server")).invalidateSessionCache();
     }
+
     await audit({
       actorUserId: claims.sub,
       targetUserId: data.userId,
@@ -223,6 +225,8 @@ export const revokeStudentSessions = createServerFn({ method: "POST" })
       .update({ isRevoked: true, revokedAt: nowIso(), updatedAt: nowIso() })
       .eq("userId", data.userId)
       .eq("isRevoked", false);
+    (await import("./app-session.server")).invalidateSessionCache();
+
     if (error) throw new Error("Could not clear those sessions.");
     await audit({
       actorUserId: claims.sub,
