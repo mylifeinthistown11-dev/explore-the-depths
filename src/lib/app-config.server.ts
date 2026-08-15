@@ -36,8 +36,28 @@ function isComplete(values: BootstrapStore): boolean {
   return CONFIG_KEYS.every((key) => Boolean(values[key]));
 }
 
-async function openDatabase(databaseUrl: string): Promise<PgClient> {
-  const { default: postgres } = await import("postgres");
+/**
+ * One pooled client per connection string for the lifetime of the server
+ * process. Opening a fresh TCP+TLS connection per request was costing seconds.
+ */
+const pools = new Map<string, PgClient>();
+
+function openDatabase(databaseUrl: string): PgClient {
+  const existing = pools.get(databaseUrl);
+  if (existing) return existing;
+  const client = postgres(databaseUrl, {
+    max: 3,
+    idle_timeout: 60,
+    connect_timeout: 8,
+    prepare: false,
+    onnotice: () => {},
+  }) as unknown as PgClient;
+  pools.set(databaseUrl, client);
+  return client;
+}
+
+/** Temporary, non-pooled client used only by the Test Connection endpoint. */
+function openThrowawayDatabase(databaseUrl: string): PgClient {
   return postgres(databaseUrl, {
     max: 1,
     idle_timeout: 2,
@@ -47,48 +67,69 @@ async function openDatabase(databaseUrl: string): Promise<PgClient> {
   }) as unknown as PgClient;
 }
 
-async function readDatabaseStore(databaseUrl: string): Promise<BootstrapStore> {
-  const sql = await openDatabase(databaseUrl);
-  try {
-    await sql.unsafe(TABLE_SQL);
-    const rows = await sql.unsafe(
-      "select key, value from codearena_private.application_configuration",
-    );
-    const values: BootstrapStore = {};
-    for (const row of rows) {
-      const key = row["key"];
-      const value = row["value"];
-      if (CONFIG_KEYS.includes(key as ConfigKey) && typeof value === "string" && value) {
-        values[key as ConfigKey] = value;
-      }
-    }
-    return values;
-  } finally {
-    await sql.end({ timeout: 1 }).catch(() => undefined);
+// The configuration DDL is idempotent, so it only needs to run once per
+// process per connection string — not on every request.
+const tableReady = new Map<string, Promise<void>>();
+
+function ensureTable(databaseUrl: string): Promise<void> {
+  let pending = tableReady.get(databaseUrl);
+  if (!pending) {
+    pending = openDatabase(databaseUrl)
+      .unsafe(TABLE_SQL)
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        tableReady.delete(databaseUrl);
+        throw error;
+      });
+    tableReady.set(databaseUrl, pending);
   }
+  return pending;
+}
+
+async function readDatabaseStore(databaseUrl: string): Promise<BootstrapStore> {
+  await ensureTable(databaseUrl);
+  const rows = await openDatabase(databaseUrl).unsafe(
+    "select key, value from codearena_private.application_configuration",
+  );
+  const values: BootstrapStore = {};
+  for (const row of rows) {
+    const key = row["key"];
+    const value = row["value"];
+    if (CONFIG_KEYS.includes(key as ConfigKey) && typeof value === "string" && value) {
+      values[key as ConfigKey] = value;
+    }
+  }
+  return values;
 }
 
 async function writeDatabaseStore(databaseUrl: string, values: BootstrapStore): Promise<void> {
-  const sql = await openDatabase(databaseUrl);
-  try {
-    await sql.unsafe(TABLE_SQL);
-    for (const key of CONFIG_KEYS) {
-      const value = values[key];
-      if (!value) continue;
-      await sql.unsafe(
-        `insert into codearena_private.application_configuration (key, value, updated_at)
-         values ($1, $2, now())
-         on conflict (key) do update set value = excluded.value, updated_at = now()`,
-        [key, value],
-      );
-    }
-  } finally {
-    await sql.end({ timeout: 1 }).catch(() => undefined);
-  }
+  await ensureTable(databaseUrl);
+  const entries = CONFIG_KEYS.filter((key) => values[key]).map((key) => [key, values[key]!]);
+  if (entries.length === 0) return;
+
+  // Single round trip instead of one statement per key.
+  const tuples = entries.map((_, index) => `($${index * 2 + 1}, $${index * 2 + 2}, now())`).join(", ");
+  await openDatabase(databaseUrl).unsafe(
+    `insert into codearena_private.application_configuration (key, value, updated_at)
+     values ${tuples}
+     on conflict (key) do update set value = excluded.value, updated_at = now()`,
+    entries.flat(),
+  );
 }
 
+/** How long a successful configuration read is trusted before re-reading. */
+const CONFIG_TTL_MS = 60_000;
+
+type LoadedConfiguration = { values: BootstrapStore; connected: boolean; durable: boolean };
+
 class ConfigurationService {
-  private async load(): Promise<{ values: BootstrapStore; connected: boolean; durable: boolean }> {
+  /** Cached read of the durable store. PostgreSQL stays the source of truth. */
+  private cache: { at: number; state: LoadedConfiguration } | null = null;
+  private inFlight: Promise<LoadedConfiguration> | null = null;
+  /** Bootstrap → PostgreSQL migration is a one-time job per process. */
+  private migrated = false;
+
+  private async readThrough(): Promise<LoadedConfiguration> {
     const bootstrap = await readBootstrap();
     const bootstrapUrl = bootstrap["OWN_SUPABASE_DB_URL"];
     const bootstrapKey = bootstrap["OWN_SUPABASE_SERVICE_ROLE_KEY"];
@@ -107,7 +148,11 @@ class ConfigurationService {
 
       // First successful connection migrates deployment/bootstrap values into
       // PostgreSQL. This is idempotent and never deletes an existing value.
-      if (Object.keys(bootstrap).length > 0) await writeDatabaseStore(bootstrapUrl, values);
+      if (!this.migrated && Object.keys(bootstrap).length > 0) {
+        const missing = CONFIG_KEYS.some((key) => bootstrap[key] && stored[key] !== bootstrap[key]);
+        if (missing) await writeDatabaseStore(bootstrapUrl, values);
+        this.migrated = true;
+      }
       return { values, connected: true, durable: true };
     } catch (error) {
       if (isComplete(bootstrap)) {
@@ -118,6 +163,31 @@ class ConfigurationService {
         cause: error,
       });
     }
+  }
+
+  private async load(): Promise<LoadedConfiguration> {
+    const cached = this.cache;
+    if (cached && Date.now() - cached.at < CONFIG_TTL_MS) return cached.state;
+    // Collapse concurrent callers onto a single read.
+    if (this.inFlight) return this.inFlight;
+
+    this.inFlight = this.readThrough()
+      .then((state) => {
+        // Only a healthy read refreshes the cache clock; a degraded read must
+        // never erase a good configuration.
+        if (state.connected || !cached) this.cache = { at: Date.now(), state };
+        return state;
+      })
+      .catch((error: unknown) => {
+        // Never drop known-good configuration because of a transient failure.
+        if (cached) return cached.state;
+        throw error;
+      })
+      .finally(() => {
+        this.inFlight = null;
+      });
+
+    return this.inFlight;
   }
 
   async initialize(): Promise<void> {
@@ -132,6 +202,7 @@ class ConfigurationService {
     const current = await this.load();
     const values = { ...current.values, [key]: value };
     const databaseUrl = values["OWN_SUPABASE_DB_URL"];
+    this.cache = null;
 
     if (databaseUrl) {
       await writeDatabaseStore(databaseUrl, values);
@@ -156,6 +227,7 @@ class ConfigurationService {
   async isConfigured(): Promise<boolean> {
     return isComplete((await this.load()).values);
   }
+
 
   async getStatus(): Promise<ConfigurationStatus> {
     const state = await this.load();
