@@ -181,6 +181,38 @@ class ConfigurationService {
 
 export const configurationService = new ConfigurationService();
 
+// Compatibility exports keep existing backend modules on the one service.
+export async function getConfig(key: ConfigKey): Promise<string | undefined> {
+  return configurationService.get(key);
+}
+
+export async function setConfig(key: ConfigKey, value: string): Promise<{ durable: true }> {
+  return configurationService.set(key, value);
+}
+
+export async function isConfigured(): Promise<boolean> {
+  return configurationService.isConfigured();
+}
+
+export async function getConfigStatus(): Promise<{
+  configured: Record<ConfigKey, boolean>;
+  applicationConfigured: boolean;
+  mode: "BOOTSTRAP" | "NORMAL";
+  durableStore: boolean;
+  adminEmail: string;
+  database: { configured: boolean; connected: boolean; reason?: string };
+}> {
+  const status = await configurationService.getStatus();
+  return {
+    configured: status.fields,
+    applicationConfigured: status.configured,
+    mode: status.mode,
+    durableStore: status.durableStore,
+    adminEmail: status.adminEmail,
+    database: status.database,
+  };
+}
+
 export function generateSessionSecret(): string {
   const bytes = new Uint8Array(48);
   crypto.getRandomValues(bytes);
